@@ -63,4 +63,4 @@ Beware that changes through this persist reboots, and possibly even factory rese
 
 ## Thanks
 
-- Syboxes and fryskii, for testing it!
+- Syboxez and fryskii, for testing it!
