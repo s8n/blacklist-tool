@@ -1,4 +1,4 @@
-// blacklist-check: shows both copies of the pl:s function blacklist that sdb
+// blacklist-tool: shows both copies of the pl:s function blacklist that sdb
 // reads, and which one is in effect.
 //
 // sdb reads blacklist.json from two places and uses the one whose top-level
@@ -10,14 +10,14 @@
 // <prefix> is 01000000000 on Switch 1 and 04000000000 on Switch 2.
 //
 // The BCAT copy is read two ways: through bcat:s (what sdb does), and straight
-// from its save. If something holds a copy locked, X kills sdb and/or bcat
-// to retry. Neither comes back, so reboot after.
+// from its save. If something holds a copy locked, the read fails; reboot and
+// retry.
 //
-// Experimental: ZR overwrites the BCAT copy in the save with an empty list
-// whose version is one above both copies, so sdb picks it over either. The
-// whole save is backed up to SD first. If the save has no blacklist.json, ZR
-// creates it and lists it in bcat's meta files. ZL puts the original back, or
-// removes what ZR added.
+// Write Empty (or a payload from SD) overwrites the BCAT copy in the save with
+// an empty list whose version is one above both copies, so sdb picks it over
+// either. The whole save is backed up to SD first. If the save has no
+// blacklist.json, it creates it and lists it in bcat's meta files. Restore
+// Original puts the original back, or removes what Write Empty added.
 //
 // From bcat and sdb in 23.5.0:
 // - /directories/<dir>/files.meta is a u32 version (1), then up to 100
@@ -63,7 +63,7 @@
 #define SDB_ID      (PFX | 0x39)
 #define BCAT_PROC_ID (PFX | 0x0C)
 
-#define SD_DIR "sdmc:/switch/blacklist-check"
+#define SD_DIR "sdmc:/switch/blacklist-tool"
 #define SD_ORIGINAL SD_DIR "/bcat-original-blacklist.json"
 #define SAVE_BLACKLIST "/directories/blacklist/files/blacklist.json"
 #define SAVE_FILES_META "/directories/blacklist/files.meta"
@@ -73,10 +73,10 @@
 #define DIR_META_ENTRY 0x40  // directories.meta
 #define META_MAX 100
 #define META_SIZE_OFF 0x28
-// Written when ZR adds blacklist.json to a save that had none, so ZL knows
-// to take it out again instead of restoring an original.
+// Written when Write Empty adds blacklist.json to a save that had none, so
+// Restore Original knows to take it out again instead of restoring an original.
 #define SD_CREATED SD_DIR "/bcat-created.txt"
-// If present, ZR writes this file as is instead of an empty list.
+// If present, Write Empty writes this file as is instead of an empty list.
 #define SD_PAYLOAD SD_DIR "/payload.json"
 
 #define RED    "\x1b[31;1m"
@@ -127,16 +127,67 @@ static void err(const char *what, Result rc) {
 }
 
 #define ROWS 41
+#define MENU_COUNT 4
 
-static void draw(const char *keys) {
-    consoleClear();
-    if (scroll > nlines - ROWS) scroll = nlines - ROWS;
+static const char *menu_labels[MENU_COUNT] = {
+    "View", "Write Empty (or payload from SD)", "Restore Original", "Dump"
+};
+
+enum { SCREEN_MAIN, SCREEN_VIEW, SCREEN_RESULT };
+static int screen;
+static int menu_sel;
+// Where the main view stops and the records detail starts, then where this
+// load's output ends. Anything after records_end is output from an action.
+static int summary_end, records_end;
+static int action_start, action_end;
+
+static void print_range(int total) {
+    if (total > ROWS)
+        printf("  " CYAN "(%d-%d of %d)" RESET, scroll + 1,
+               scroll + ROWS < total ? scroll + ROWS : total, total);
+}
+
+// Prints lines [first, end) from the current scroll offset.
+static int print_lines(int first, int end) {
+    int total = end - first;
+    if (scroll > total - ROWS) scroll = total - ROWS;
     if (scroll < 0) scroll = 0;
-    for (int i = scroll; i < nlines && i < scroll + ROWS; i++) printf("%s" RESET "\n", lines[i]);
-    printf("\x1b[43;1H" YELLOW "[ZR] write payload.json/empty BCAT list (experimental) [ZL] restore" RESET);
-    printf("\x1b[44;1H%s", keys);
-    if (nlines > ROWS) printf("  " CYAN "(%d-%d of %d)" RESET, scroll + 1,
-                              scroll + ROWS < nlines ? scroll + ROWS : nlines, nlines);
+    for (int i = first + scroll; i < end && i < first + scroll + ROWS; i++)
+        printf("%s" RESET "\n", lines[i]);
+    return total;
+}
+
+static void draw_main(void) {
+    consoleClear();
+    int total = print_lines(0, summary_end);
+    printf("\x1b[43;1H");
+    for (int i = 0; i < MENU_COUNT; i++) {
+        if (i == menu_sel) printf("\x1b[30;42m %s " RESET, menu_labels[i]);
+        else printf(" %s ", menu_labels[i]);
+        if (i + 1 < MENU_COUNT) printf("  ");
+    }
+    printf("\x1b[44;1H" CYAN " < > choose   [A] select   [+] exit   up/down scroll" RESET);
+    print_range(total);
+    consoleUpdate(NULL);
+}
+
+static void draw_view(void) {
+    consoleClear();
+    int total = print_lines(summary_end, records_end);
+    if (total <= 0) printf("No records were read.\n");
+    printf("\x1b[43;1H" YELLOW "[B] back" RESET);
+    printf("\x1b[44;1H" CYAN " up/down scroll   L/R page" RESET);
+    print_range(total);
+    consoleUpdate(NULL);
+}
+
+static void draw_result(void) {
+    consoleClear();
+    int total = print_lines(action_start, action_end);
+    if (total <= 0) printf("Done.\n");
+    printf("\x1b[43;1H" YELLOW "[B] back" RESET);
+    printf("\x1b[44;1H" CYAN " up/down scroll   L/R page" RESET);
+    print_range(total);
     consoleUpdate(NULL);
 }
 
@@ -154,7 +205,7 @@ typedef struct {
 
 static Copy sysdata = {"system data"}, bcat_ipc = {"BCAT (bcat:s)"}, bcat_save = {"BCAT (save)"};
 static bool killed_sdb, killed_bcat;
-// The delivery cache save, for the experimental write. Set when the save is
+// The delivery cache save, for the write path. Set when the save is
 // found, even if it couldn't be opened or has no blacklist.json.
 static FsSaveDataInfo bcat_save_info;
 static bool have_bcat_save_info;
@@ -198,7 +249,7 @@ static void read_sysdata(void) {
     Result rc = romfsMountFromDataArchive(SYSDATA_ID, NcmStorageId_BuiltInSystem, "bl828");
     if (R_FAILED(rc)) {
         err("Can't mount it", rc);
-        if (!killed_sdb) out("  If sdb holds it, X can kill sdb to retry.\n");
+        if (!killed_sdb) out("  If sdb holds it, reboot and retry.\n");
         return;
     }
     FILE *f = fopen("bl828:/blacklist.json", "rb");
@@ -230,7 +281,7 @@ static void read_bcat_ipc(void) {
     Result rc = bcatOpenStorage(&st, BCAT_ID);
     if (R_FAILED(rc)) {
         err("Can't open the delivery cache", rc);
-        if (!killed_sdb) out("  If sdb holds it open, X can kill sdb to retry.\n");
+        if (!killed_sdb) out("  If sdb holds it open, reboot and retry.\n");
         return;
     }
     out("  Opened via %s\n", st.service_name);
@@ -351,7 +402,7 @@ static void read_bcat_save(void) {
         if (R_FAILED(rc)) {
             err("Can't open it", rc);
             if (R_MODULE(rc) == 2 && R_DESCRIPTION(rc) == 7)
-                out("  Something has it open. X can kill bcat (and sdb) to retry.\n");
+                out("  Something has it open. Reboot and retry.\n");
             continue;
         }
         FsDir d;
@@ -521,7 +572,7 @@ static void load(void) {
     clear_lines();
 
     get_fw();
-    out("blacklist-check (" PLATFORM "), firmware %u.%u.%u%s%s\n", fw_major, fw_minor, fw_micro,
+    out("blacklist-tool v1.0.0 (" PLATFORM "), firmware %u.%u.%u%s%s\n", fw_major, fw_minor, fw_micro,
         killed_sdb ? ", " YELLOW "sdb killed" RESET : "", killed_bcat ? ", " YELLOW "bcat killed" RESET : "");
     out("\n");
     read_sysdata();
@@ -550,8 +601,10 @@ static void load(void) {
         out("  In effect: system data copy (no BCAT copy read)\n");
     out("\n");
 
+    summary_end = nlines;
     if (sysdata.json) { print_records(&sysdata); out("\n"); }
     if (bc && bc->json) { print_records(bc); out("\n"); }
+    records_end = nlines;
 }
 
 static bool write_file(const char *path, const void *data, size_t len) {
@@ -607,45 +660,14 @@ static bool wait_for(PadState *pad, u64 *pressed, u64 mask) {
     return false;
 }
 
-static void kill_one(u64 id, const char *name, bool *flag) {
-    Result rc = pmshellTerminateProgram(id);
-    if (R_SUCCEEDED(rc)) { *flag = true; printf("Killed %s.\n", name); }
-    else printf("Killing %s: %04d-%04d (0x%X)\n", name, 2000 + R_MODULE(rc), R_DESCRIPTION(rc), rc);
-}
+// ---- write/restore the BCAT copy ----
 
-static void kill_menu(PadState *pad) {
-    consoleClear();
-    printf(YELLOW "Kill a sysmodule and retry?" RESET "\n\n");
-    printf("sdb  (%016llX) serves pl:s and reads both blacklist copies.\n", (unsigned long long)SDB_ID);
-    printf("     It also serves shared fonts, settings data and more.\n");
-    printf("bcat (%016llX) owns the delivery cache save.\n", (unsigned long long)BCAT_PROC_ID);
-    printf("     Killing it stops the bcat:s read, but can free the save.\n\n");
-    printf("Neither comes back. Fonts, the home menu or games can break until\n");
-    printf("you reboot, and the console might crash outright.\n\n");
-    printf("[Y] kill sdb  [A] kill bcat  [X] kill both  [B] cancel\n");
-    consoleUpdate(NULL);
-
-    u64 down = 0;
-    if (!wait_for(pad, &down, HidNpadButton_Y | HidNpadButton_A | HidNpadButton_X | HidNpadButton_B)) return;
-    if (down & HidNpadButton_B) return;
-
-    printf("\n");
-    Result rc = pmshellInitialize();
-    if (R_FAILED(rc)) {
-        printf("pm:shell: %04d-%04d (0x%X)\n", 2000 + R_MODULE(rc), R_DESCRIPTION(rc), rc);
-    } else {
-        if (down & (HidNpadButton_Y | HidNpadButton_X)) kill_one(SDB_ID, "sdb", &killed_sdb);
-        if (down & (HidNpadButton_A | HidNpadButton_X)) kill_one(BCAT_PROC_ID, "bcat", &killed_bcat);
-        pmshellExit();
+static bool confirm(PadState *pad, bool ban_warning) {
+    if (ban_warning) {
+        printf("\n" RED "Warning: writing over the BCAT blacklist may lead to this console" RESET "\n");
+        printf(RED "being banned. We simply do not know, but you assume the risk." RESET "\n");
     }
-    consoleUpdate(NULL);
-    svcSleepThread(500000000ULL); // let FS drop their mounts
-}
-
-// ---- experimental: overwrite the BCAT copy ----
-
-static bool confirm(PadState *pad) {
-    printf("\n[A] go ahead  [B] cancel\n");
+    printf("\n[A] %s  [B] cancel\n", ban_warning ? "press again to confirm" : "go ahead");
     consoleUpdate(NULL);
     u64 down = 0;
     return wait_for(pad, &down, HidNpadButton_A | HidNpadButton_B) && (down & HidNpadButton_A);
@@ -898,7 +920,7 @@ static Result open_save_for_writing(FsFileSystem *fs) {
     Result rc = open_bcat_save_rw(fs);
     if (R_FAILED(rc)) {
         err("Can't open the save for writing", rc);
-        if (!killed_bcat) out("  Kill bcat with X and try again.\n");
+        if (!killed_bcat) out("  Reboot and try again.\n");
     }
     return rc;
 }
@@ -981,7 +1003,7 @@ static void write_empty_bcat(PadState *pad) {
     }
 
     consoleClear();
-    printf(YELLOW "%s the BCAT blacklist? (experimental)" RESET "\n\n", existed ? "Overwrite" : "Add");
+    printf(YELLOW "%s the BCAT blacklist?" RESET "\n\n", existed ? "Overwrite" : "Add");
     printf("Save %016llX, %s\n", (unsigned long long)bcat_save_info.save_data_id, SAVE_BLACKLIST);
     if (existed)
         printf("Now: version %s%llu, %d record(s), %llu bytes\n", have_cur_v ? "" : "? ", cur_v,
@@ -1003,16 +1025,12 @@ static void write_empty_bcat(PadState *pad) {
         if (recs->n > 5) printf("     ...\n");
     }
     printf("\n");
-    if (existed) {
-        printf("The size in files.meta is updated to match. Its digest is kept:\n");
-        printf("sdb never checks it, and bcat probably compares it with the server's\n");
-        printf("list to decide what to download (not verified).\n\n");
-    } else {
+    if (!existed) {
         printf("bcat may remove or replace it the next time it syncs with Nintendo,\n");
         printf("since the server's list doesn't match it (not verified).\n\n");
     }
-    printf("The whole save is copied to " SD_DIR "/ first.\n");
-    if (!confirm(pad)) {
+    printf("The whole save will be copied to " SD_DIR "/ first.\n");
+    if (!confirm(pad, true)) {
         out("  Cancelled.\n");
         goto done;
     }
@@ -1033,8 +1051,8 @@ static void write_empty_bcat(PadState *pad) {
     }
     out("  %d file(s) backed up.\n", n);
 
-    // What ZL goes back to: the first original kept, or a note that there
-    // was no file.
+    // What Restore Original goes back to: the first original kept, or a note
+    // that there was no file.
     struct stat st;
     if (existed) {
         if (stat(SD_ORIGINAL, &st) != 0) {
@@ -1047,8 +1065,8 @@ static void write_empty_bcat(PadState *pad) {
             out("  " SD_ORIGINAL " already exists, left as is.\n");
         }
     } else {
-        static const char note[] = "blacklist-check added blacklist.json to a BCAT save that had none.\n"
-                                   "ZL removes it again.\n";
+        static const char note[] = "blacklist-tool added blacklist.json to a BCAT save that had none.\n"
+                                   "Restore Original removes it again.\n";
         if (!write_file(SD_CREATED, note, sizeof note - 1)) {
             out("  " RED "Can't write " SD_CREATED ", not writing anything." RESET "\n");
             goto done;
@@ -1059,7 +1077,6 @@ static void write_empty_bcat(PadState *pad) {
     if (R_FAILED(rc)) { err("Write failed", rc); goto done; }
     out("  " GREEN "Wrote version %llu and read it back." RESET "\n", v);
     out("  Reboot, then run this again: pl:s should report version %llu\n", v);
-    out("  if sdb accepts the file through bcat.\n");
 
 done:
     json_free(payload);
@@ -1099,13 +1116,13 @@ static void restore_bcat(PadState *pad) {
     printf(YELLOW "Restore the BCAT blacklist?" RESET "\n\n");
     printf("Save %016llX\n\n", (unsigned long long)bcat_save_info.save_data_id);
     if (created) {
-        printf("ZR added blacklist.json to this save. This deletes it and its\n");
+        printf("Write Empty added blacklist.json to this save. This deletes it and its\n");
         printf("files.meta entry, and the blacklist directory if nothing else is in it.\n");
     } else {
         printf("Writes " SD_ORIGINAL " (%ld bytes)\n", n);
         printf("to %s and sets its size in files.meta to match.\n", SAVE_BLACKLIST);
     }
-    if (!confirm(pad)) {
+    if (!confirm(pad, false)) {
         out("  Cancelled.\n");
     } else {
         Result rc = created ? remove_save_blacklist(&fs) : write_save_blacklist(&fs, data, n);
@@ -1127,31 +1144,63 @@ int main(int argc, char **argv) {
     padInitializeDefault(&pad);
     setsysInitialize();
 
-    const char *keys_live = "[A] reload [Y] save to SD [X] kill sysmodule [+] exit";
-    const char *keys_dead = "[A] reload [Y] save to SD [X] kill [-] reboot [+] exit";
-
     load();
-    draw(killed_sdb || killed_bcat ? keys_dead : keys_live);
+    screen = SCREEN_MAIN;
+    scroll = 0;
+    draw_main();
 
     u64 held_since = 0;
     while (appletMainLoop()) {
         padUpdate(&pad);
         u64 down = padGetButtonsDown(&pad);
         u64 held = padGetButtons(&pad);
-        bool dead = killed_sdb || killed_bcat;
         bool redraw = false;
 
         if (down & HidNpadButton_Plus) break;
-        if (down & HidNpadButton_A) { load(); redraw = true; }
-        if (down & HidNpadButton_Y) { save_sd(); redraw = true; }
-        if (down & HidNpadButton_X) { kill_menu(&pad); load(); redraw = true; }
-        if (down & HidNpadButton_ZR) { write_empty_bcat(&pad); scroll = nlines; redraw = true; }
-        if (down & HidNpadButton_ZL) { restore_bcat(&pad); scroll = nlines; redraw = true; }
-        if ((down & HidNpadButton_Minus) && dead) {
-            printf("\nRebooting...\n");
-            consoleUpdate(NULL);
-            if (R_SUCCEEDED(bpcInitialize())) bpcRebootSystem();
-            printf("Reboot failed, hold the power button.\n");
+
+        if (screen == SCREEN_MAIN) {
+            if (down & HidNpadButton_Left) {
+                menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT;
+                redraw = true;
+            }
+            if (down & HidNpadButton_Right) {
+                menu_sel = (menu_sel + 1) % MENU_COUNT;
+                redraw = true;
+            }
+            if (down & HidNpadButton_A) {
+                scroll = 0;
+                switch (menu_sel) {
+                case 0:
+                    screen = SCREEN_VIEW;
+                    break;
+                case 1:
+                    action_start = nlines;
+                    write_empty_bcat(&pad);
+                    action_end = nlines;
+                    screen = SCREEN_RESULT;
+                    break;
+                case 2:
+                    action_start = nlines;
+                    restore_bcat(&pad);
+                    action_end = nlines;
+                    screen = SCREEN_RESULT;
+                    break;
+                case 3:
+                    action_start = nlines;
+                    save_sd();
+                    action_end = nlines;
+                    screen = SCREEN_RESULT;
+                    break;
+                }
+                redraw = true;
+            }
+        } else if (down & HidNpadButton_B) {
+            // Coming back from an action, reread so the summary and View show
+            // what's on the console now.
+            if (screen == SCREEN_RESULT) load();
+            screen = SCREEN_MAIN;
+            scroll = 0;
+            redraw = true;
         }
 
         // Up/down scroll a line (repeating when held), L/R a page.
@@ -1163,8 +1212,13 @@ int main(int argc, char **argv) {
         if (down & HidNpadButton_L) { scroll -= ROWS; redraw = true; }
         if (down & HidNpadButton_R) { scroll += ROWS; redraw = true; }
 
-        if (redraw) draw(killed_sdb || killed_bcat ? keys_dead : keys_live);
-        else consoleUpdate(NULL);
+        if (redraw) {
+            if (screen == SCREEN_VIEW) draw_view();
+            else if (screen == SCREEN_RESULT) draw_result();
+            else draw_main();
+        } else {
+            consoleUpdate(NULL);
+        }
     }
 
     setsysExit();

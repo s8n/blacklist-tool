@@ -46,8 +46,8 @@ endif
 #   of a homebrew executable (.nro). This is intended to be used for sysmodules.
 #   NACP building is skipped as well.
 #---------------------------------------------------------------------------------
-TARGET		:=	blacklist-check$(if $(filter switch2,$(PLATFORM)),-switch2)
-APP_TITLE	:=	blacklist-check
+TARGET		:=	blacklist-tool$(if $(filter switch2,$(PLATFORM)),-switch2)
+APP_TITLE	:=	blacklist-tool
 APP_AUTHOR	:=	ave
 APP_VERSION	:=	1.0.0
 BUILD		:=	build$(if $(filter switch2,$(PLATFORM)),-switch2)
