@@ -49,7 +49,7 @@ endif
 TARGET		:=	blacklist-tool$(if $(filter switch2,$(PLATFORM)),-switch2)
 APP_TITLE	:=	blacklist-tool
 APP_AUTHOR	:=	ave
-APP_VERSION	:=	1.0.0
+APP_VERSION	:=	1.1
 BUILD		:=	build$(if $(filter switch2,$(PLATFORM)),-switch2)
 SOURCES		:=	source
 DATA		:=	data

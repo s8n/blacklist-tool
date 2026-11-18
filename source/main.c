@@ -127,15 +127,25 @@ static void err(const char *what, Result rc) {
 }
 
 #define ROWS 41
-#define MENU_COUNT 4
+#define MENU_COUNT 6
+
+enum {
+    MENU_VIEW, MENU_WRITE_EMPTY, MENU_WRITE_PAYLOAD, MENU_RESTORE, MENU_DUMP,
+    MENU_SYNC
+};
 
 static const char *menu_labels[MENU_COUNT] = {
-    "View", "Write Empty (or payload from SD)", "Restore Original", "Dump"
+    "View", "Write Empty", "Write payload from SD", "Restore Original", "Dump",
+    "Sync sysdata to BCAT"
 };
 
 enum { SCREEN_MAIN, SCREEN_VIEW, SCREEN_RESULT };
 static int screen;
 static int menu_sel;
+static int menu_items = 4;
+static int menu_map[MENU_COUNT];
+static bool bcat_newer;
+static bool have_payload;
 // Where the main view stops and the records detail starts, then where this
 // load's output ends. Anything after records_end is output from an action.
 static int summary_end, records_end;
@@ -161,12 +171,16 @@ static void draw_main(void) {
     consoleClear();
     int total = print_lines(0, summary_end);
     printf("\x1b[43;1H");
-    for (int i = 0; i < MENU_COUNT; i++) {
-        if (i == menu_sel) printf("\x1b[30;42m %s " RESET, menu_labels[i]);
-        else printf(" %s ", menu_labels[i]);
-        if (i + 1 < MENU_COUNT) printf("  ");
+    for (int i = 0; i < menu_items; i++) {
+        int action = menu_map[i];
+        if (menu_items > 4 && i == 4) printf("\x1b[44;1H");
+        if (i == menu_sel) printf("\x1b[30;42m %s " RESET, menu_labels[action]);
+        else printf(" %s ", menu_labels[action]);
+        if (i + 1 < menu_items) printf("  ");
     }
-    printf("\x1b[44;1H" CYAN " < > choose   [A] select   [+] exit   up/down scroll" RESET);
+    if (menu_items > 4) printf("\x1b[45;1H");
+    else printf("\x1b[44;1H");
+    printf(CYAN " < > choose   [A] select   [+] exit   up/down scroll" RESET);
     print_range(total);
     consoleUpdate(NULL);
 }
@@ -572,7 +586,7 @@ static void load(void) {
     clear_lines();
 
     get_fw();
-    out("blacklist-tool v1.0.0 (" PLATFORM "), firmware %u.%u.%u%s%s\n", fw_major, fw_minor, fw_micro,
+    out("blacklist-tool v1.1 (" PLATFORM "), firmware %u.%u.%u%s%s\n", fw_major, fw_minor, fw_micro,
         killed_sdb ? ", " YELLOW "sdb killed" RESET : "", killed_bcat ? ", " YELLOW "bcat killed" RESET : "");
     out("\n");
     read_sysdata();
@@ -605,6 +619,21 @@ static void load(void) {
     if (sysdata.json) { print_records(&sysdata); out("\n"); }
     if (bc && bc->json) { print_records(bc); out("\n"); }
     records_end = nlines;
+
+    // The sync option only makes sense when BCAT is the newer copy.
+    bcat_newer = sysdata.has_version && bc && bc->has_version && bc->version > sysdata.version;
+
+    struct stat st;
+    have_payload = stat(SD_PAYLOAD, &st) == 0;
+
+    menu_items = 0;
+    menu_map[menu_items++] = MENU_VIEW;
+    menu_map[menu_items++] = MENU_WRITE_EMPTY;
+    if (have_payload) menu_map[menu_items++] = MENU_WRITE_PAYLOAD;
+    menu_map[menu_items++] = MENU_RESTORE;
+    menu_map[menu_items++] = MENU_DUMP;
+    if (bcat_newer) menu_map[menu_items++] = MENU_SYNC;
+    if (menu_sel >= menu_items) menu_sel = menu_items - 1;
 }
 
 static bool write_file(const char *path, const void *data, size_t len) {
@@ -925,8 +954,51 @@ static Result open_save_for_writing(FsFileSystem *fs) {
     return rc;
 }
 
-static void write_empty_bcat(PadState *pad) {
-    out("\n" CYAN "Write empty BCAT list" RESET "\n");
+// Copies the save to SD and keeps the current blacklist for Restore Original.
+// Returns false when anything failed and nothing should be written.
+static bool backup_bcat_before_write(FsFileSystem *fs, bool existed, const u8 *cur, u64 cur_len) {
+    mkdir("sdmc:/switch", 0777);
+    mkdir(SD_DIR, 0777);
+    char stamp[32], dir[128];
+    time_t t = time(NULL);
+    struct tm tm;
+    localtime_r(&t, &tm);
+    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
+    snprintf(dir, sizeof dir, SD_DIR "/%s-bcat-save", stamp);
+    out("  Backing up the save to %s:\n", dir);
+    int n = backup_tree(fs, "", dir);
+    if (n < 0) {
+        out("  " RED "Backup failed, not writing anything." RESET "\n");
+        return false;
+    }
+    out("  %d file(s) backed up.\n", n);
+
+    // What Restore Original goes back to: the first original kept, or a note
+    // that there was no file.
+    struct stat st;
+    if (existed) {
+        if (stat(SD_ORIGINAL, &st) != 0) {
+            if (!write_file(SD_ORIGINAL, cur, cur_len)) {
+                out("  " RED "Can't write " SD_ORIGINAL ", not writing anything." RESET "\n");
+                return false;
+            }
+            out("  Original kept at " SD_ORIGINAL "\n");
+        } else {
+            out("  " SD_ORIGINAL " already exists, left as is.\n");
+        }
+    } else {
+        static const char note[] = "blacklist-tool added blacklist.json to a BCAT save that had none.\n"
+                                   "Restore Original removes it again.\n";
+        if (!write_file(SD_CREATED, note, sizeof note - 1)) {
+            out("  " RED "Can't write " SD_CREATED ", not writing anything." RESET "\n");
+            return false;
+        }
+    }
+    return true;
+}
+
+static void write_bcat(PadState *pad, bool use_payload) {
+    out("\n" CYAN "%s" RESET "\n", use_payload ? "Write payload from SD" : "Write empty BCAT list");
     if (!sysdata.has_version) {
         out("  " RED "System data version unknown, can't pick a version above it." RESET "\n");
         return;
@@ -961,7 +1033,14 @@ static void write_empty_bcat(PadState *pad) {
     JVal *payload = NULL;
     int nrecs = 0;
 
-    FILE *pf = fopen(SD_PAYLOAD, "rb");
+    FILE *pf = NULL;
+    if (use_payload) {
+        pf = fopen(SD_PAYLOAD, "rb");
+        if (!pf) {
+            out("  " RED "Can't open " SD_PAYLOAD "." RESET "\n");
+            goto done;
+        }
+    }
     if (pf) {
         fseek(pf, 0, SEEK_END);
         long n = ftell(pf);
@@ -1035,43 +1114,7 @@ static void write_empty_bcat(PadState *pad) {
         goto done;
     }
 
-    mkdir("sdmc:/switch", 0777);
-    mkdir(SD_DIR, 0777);
-    char stamp[32], dir[128];
-    time_t t = time(NULL);
-    struct tm tm;
-    localtime_r(&t, &tm);
-    strftime(stamp, sizeof stamp, "%Y%m%d-%H%M%S", &tm);
-    snprintf(dir, sizeof dir, SD_DIR "/%s-bcat-save", stamp);
-    out("  Backing up the save to %s:\n", dir);
-    int n = backup_tree(&fs, "", dir);
-    if (n < 0) {
-        out("  " RED "Backup failed, not writing anything." RESET "\n");
-        goto done;
-    }
-    out("  %d file(s) backed up.\n", n);
-
-    // What Restore Original goes back to: the first original kept, or a note
-    // that there was no file.
-    struct stat st;
-    if (existed) {
-        if (stat(SD_ORIGINAL, &st) != 0) {
-            if (!write_file(SD_ORIGINAL, cur, cur_len)) {
-                out("  " RED "Can't write " SD_ORIGINAL ", not writing anything." RESET "\n");
-                goto done;
-            }
-            out("  Original kept at " SD_ORIGINAL "\n");
-        } else {
-            out("  " SD_ORIGINAL " already exists, left as is.\n");
-        }
-    } else {
-        static const char note[] = "blacklist-tool added blacklist.json to a BCAT save that had none.\n"
-                                   "Restore Original removes it again.\n";
-        if (!write_file(SD_CREATED, note, sizeof note - 1)) {
-            out("  " RED "Can't write " SD_CREATED ", not writing anything." RESET "\n");
-            goto done;
-        }
-    }
+    if (!backup_bcat_before_write(&fs, existed, cur, cur_len)) goto done;
 
     rc = write_save_blacklist(&fs, (const u8 *)body, len);
     if (R_FAILED(rc)) { err("Write failed", rc); goto done; }
@@ -1082,6 +1125,59 @@ done:
     json_free(payload);
     free(body);
     json_free(cur_json);
+    free(cur);
+    fsFsClose(&fs);
+}
+
+static void sync_sysdata_bcat(PadState *pad) {
+    out("\n" CYAN "Sync system data to BCAT" RESET "\n");
+    const Copy *bc = bcat_ipc.have ? &bcat_ipc : bcat_save.have ? &bcat_save : NULL;
+    if (!sysdata.have || !sysdata.json || !sysdata.has_version) {
+        out("  " RED "The system data copy has no readable version." RESET "\n");
+        return;
+    }
+    if (!bc || !bc->has_version || bc->version <= sysdata.version) {
+        out("  " RED "BCAT isn't a higher version than system data." RESET "\n");
+        return;
+    }
+
+    FsFileSystem fs;
+    if (R_FAILED(open_save_for_writing(&fs))) return;
+
+    // Read what's there now through this handle, as write_bcat does.
+    u8 *cur = NULL;
+    u64 cur_len = 0;
+    Result rc = read_save_file(&fs, SAVE_BLACKLIST, &cur, &cur_len);
+    bool existed = R_SUCCEEDED(rc);
+    if (!existed && !fs_not_found(rc)) {
+        err("Can't read " SAVE_BLACKLIST, rc);
+        fsFsClose(&fs);
+        return;
+    }
+
+    consoleClear();
+    printf(YELLOW "Sync system data to the BCAT blacklist?" RESET "\n\n");
+    printf("System data: version %llu, %llu bytes\n",
+           sysdata.version, (unsigned long long)sysdata.len);
+    printf("BCAT now:    version %llu\n", bc->version);
+    printf("The BCAT copy will get the system data content and version.\n");
+    printf("After the reboot, sdb will use the system data copy.\n\n");
+    printf("%s\n\n", existed ? "The current BCAT copy and the whole save are kept on SD."
+                             : "The whole save is kept on SD. BCAT had no blacklist.json.");
+    printf("The whole save will be copied to " SD_DIR "/ first.\n");
+    if (!confirm(pad, true)) {
+        out("  Cancelled.\n");
+        goto done;
+    }
+
+    if (!backup_bcat_before_write(&fs, existed, cur, cur_len)) goto done;
+
+    rc = write_save_blacklist(&fs, sysdata.data, sysdata.len);
+    if (R_FAILED(rc)) { err("Write failed", rc); goto done; }
+    out("  " GREEN "Wrote the system data copy to BCAT and read it back." RESET "\n");
+    out("  Reboot, then run this again: both copies should report version %llu\n", sysdata.version);
+
+done:
     free(cur);
     fsFsClose(&fs);
 }
@@ -1160,34 +1256,46 @@ int main(int argc, char **argv) {
 
         if (screen == SCREEN_MAIN) {
             if (down & HidNpadButton_Left) {
-                menu_sel = (menu_sel + MENU_COUNT - 1) % MENU_COUNT;
+                menu_sel = (menu_sel + menu_items - 1) % menu_items;
                 redraw = true;
             }
             if (down & HidNpadButton_Right) {
-                menu_sel = (menu_sel + 1) % MENU_COUNT;
+                menu_sel = (menu_sel + 1) % menu_items;
                 redraw = true;
             }
             if (down & HidNpadButton_A) {
                 scroll = 0;
-                switch (menu_sel) {
-                case 0:
+                switch (menu_map[menu_sel]) {
+                case MENU_VIEW:
                     screen = SCREEN_VIEW;
                     break;
-                case 1:
+                case MENU_WRITE_EMPTY:
                     action_start = nlines;
-                    write_empty_bcat(&pad);
+                    write_bcat(&pad, false);
                     action_end = nlines;
                     screen = SCREEN_RESULT;
                     break;
-                case 2:
+                case MENU_WRITE_PAYLOAD:
+                    action_start = nlines;
+                    write_bcat(&pad, true);
+                    action_end = nlines;
+                    screen = SCREEN_RESULT;
+                    break;
+                case MENU_RESTORE:
                     action_start = nlines;
                     restore_bcat(&pad);
                     action_end = nlines;
                     screen = SCREEN_RESULT;
                     break;
-                case 3:
+                case MENU_DUMP:
                     action_start = nlines;
                     save_sd();
+                    action_end = nlines;
+                    screen = SCREEN_RESULT;
+                    break;
+                case MENU_SYNC:
+                    action_start = nlines;
+                    sync_sysdata_bcat(&pad);
                     action_end = nlines;
                     screen = SCREEN_RESULT;
                     break;
